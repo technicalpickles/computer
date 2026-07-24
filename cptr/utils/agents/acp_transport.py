@@ -13,26 +13,20 @@ stripped (via `bytes.lstrip()`, which also treats embedded `\n`/`\r` as whitespa
 before sniffing the frame kind, and a `Content-Length` header present but missing a
 valid integer value raises `RuntimeError` rather than returning `None`.
 
-The code has an `if not line: return {}, ...` branch intended to turn a "blank NDJSON
-line" into an empty-dict message. In practice this branch is unreachable through the
-public function: the unconditional `buffer.lstrip()` at the top of the function always
-consumes a full run of leading whitespace, and `\n` is itself whitespace, so any blank
-line sitting at the front of `buffer` is absorbed by that lstrip before the "first
-line" scan ever runs (post-lstrip, `buffer[0]` is always non-whitespace unless the
-buffer is now empty). A stray blank line between two NDJSON messages therefore never
-surfaces as a distinct `{}` message on its own extraction pass -- it is silently
-skipped, and the *next* real JSON message is returned directly. `tests/test_acp_framing.py`
-pins this exact (if slightly surprising) behavior instead of asserting the unreachable
-branch.
-
-Behavioral choice — blank-line `{}` messages: the original `_reader_loop` handled every
-extracted message (including `{}`) via `_handle_message`, which routes anything without
-a matching `id`/`result`/`error` and without `method == "session/request_permission"`
-straight onto `client.events`. So a blank NDJSON line used to become a `{}` entry on
-`client.events`. To keep observable behavior identical, the reader loop here does the
-same: every message popped off the transport queue (including empty dicts) is delivered
-to `receive()` and on to `AcpClient._handle_message` unchanged. `StdioSubprocessTransport`
-does not filter empty dicts out of its internal queue.
+The code has an `if not line: return {}, ...` branch that looks like it is meant to turn
+a "blank NDJSON line" into an empty-dict message. In practice this branch is unreachable
+through the public function: the unconditional `buffer.lstrip()` at the top of the
+function always consumes a full run of leading whitespace, and `\n` is itself
+whitespace, so any blank line sitting at the front of `buffer` is absorbed by that
+lstrip before the "first line" scan ever runs (post-lstrip, `buffer[0]` is always
+non-whitespace unless the buffer is now empty). A stray blank line between two NDJSON
+messages therefore never surfaces as a distinct `{}` message on its own extraction pass
+-- it is silently skipped, and the *next* real JSON message is returned directly.
+`tests/test_acp_framing.py` pins this exact (if slightly surprising) behavior instead of
+asserting the unreachable branch. The dead branch itself is left in place verbatim since
+removing it is outside the scope of this refactor, and downstream code (the reader
+loops in this module) still forwards empty-dict messages unchanged in the unlikely event
+some other code path ever produces one.
 """
 
 from __future__ import annotations

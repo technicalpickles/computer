@@ -348,6 +348,33 @@ def acp_models_from_setup(setup: dict[str, Any]) -> list[str]:
     return result
 
 
-async def acp_event_stream(client: AcpClient) -> AsyncIterator[dict[str, Any]]:
-    while True:
-        yield await client.events.get()
+async def acp_turn_event_stream(
+    client: AcpClient, prompt_task: asyncio.Task, *, grace: float = 0.25
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield session events for one turn, ending shortly after the prompt completes.
+
+    Races the events queue against the prompt task instead of only checking
+    ``prompt_task.done()`` after an event arrives: when the agent's final
+    notifications and the prompt response land in a single read burst, no further
+    event ever arrives to trigger that check, and a naive ``events.get()`` loop
+    blocks forever. After the prompt resolves, keeps draining events that arrive
+    within ``grace`` seconds so trailing notifications aren't dropped.
+    """
+    get_task: asyncio.Task | None = None
+    try:
+        while True:
+            get_task = asyncio.create_task(client.events.get())
+            if not prompt_task.done():
+                await asyncio.wait({get_task, prompt_task}, return_when=asyncio.FIRST_COMPLETED)
+            if get_task.done():
+                yield get_task.result()
+                continue
+            try:
+                yield await asyncio.wait_for(get_task, timeout=grace)
+            except asyncio.TimeoutError:
+                return
+    finally:
+        if get_task is not None and not get_task.done():
+            get_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await get_task

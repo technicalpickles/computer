@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from cptr.routers import (
+    acp_router,
     admin_router,
     audio_router,
     auth_router,
@@ -276,6 +277,7 @@ async def get_config():
 
 
 # Routers
+app.include_router(acp_router)
 app.include_router(admin_router)
 app.include_router(audio_router)
 app.include_router(auth_router)

@@ -231,3 +231,38 @@ def connected_pair() -> tuple[InMemoryTransport, InMemoryTransport]:
     side_a = InMemoryTransport(outgoing=queue_a, incoming=queue_b, closed=closed)
     side_b = InMemoryTransport(outgoing=queue_b, incoming=queue_a, closed=closed)
     return side_a, side_b
+
+
+class WebSocketTransport:
+    """ACP transport backed by an already-`accept()`ed Starlette/FastAPI `WebSocket`.
+
+    Framing is trivial here: one JSON message per text frame, since the WebSocket
+    protocol already provides message boundaries -- no NDJSON/Content-Length sniffing
+    like the stdio transport needs.
+    """
+
+    def __init__(self, websocket: Any) -> None:
+        self.websocket = websocket
+
+    async def start(self) -> None:
+        pass
+
+    async def send(self, message: dict[str, Any]) -> None:
+        await self.websocket.send_text(json.dumps(message, separators=(",", ":")))
+
+    async def receive(self) -> dict[str, Any]:
+        from starlette.websockets import WebSocketDisconnect
+
+        try:
+            text = await self.websocket.receive_text()
+        except WebSocketDisconnect as exc:
+            raise TransportClosed("websocket disconnected") from exc
+        except RuntimeError as exc:
+            # e.g. "Cannot call 'receive' once a disconnect message has been received."
+            # -- raised when the client already went away and we try to read again.
+            raise TransportClosed("websocket already closed") from exc
+        return json.loads(text)
+
+    async def close(self) -> None:
+        with suppress(Exception):
+            await self.websocket.close()

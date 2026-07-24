@@ -1,5 +1,6 @@
 """cptr API routers."""
 
+from cptr.routers.acp import router as acp_router
 from cptr.routers.admin import router as admin_router
 from cptr.routers.audio import router as audio_router
 from cptr.routers.auth import router as auth_router
@@ -22,6 +23,7 @@ from cptr.routers.terminal import router as terminal_router
 from cptr.routers.workspace import router as workspace_router
 
 __all__ = [
+    "acp_router",
     "admin_router",
     "audio_router",
     "auth_router",

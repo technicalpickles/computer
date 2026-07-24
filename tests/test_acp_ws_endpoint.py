@@ -51,6 +51,11 @@ async def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setattr(config_module, "CONFIG_FILE", config_file, raising=True)
     monkeypatch.setattr(config_module, "_config_cache", None, raising=True)
 
+    # A prior test in the same process may have left a real engine bound (pointed at
+    # *its* tmp DB file); dispose it before rebinding the globals below, rather than
+    # just dropping the reference and leaking the connection/pool.
+    if db_module._engine is not None:
+        await db_module._engine.dispose()
     db_module._engine = None
     db_module._async_session = None
 
@@ -58,8 +63,11 @@ async def isolated_db(tmp_path, monkeypatch):
 
     yield
 
-    engine = db_module.get_engine()
-    await engine.dispose()
+    # Only dispose if something actually created an engine during the test --
+    # `get_engine()` would lazily create one just to immediately dispose it, which is
+    # pure waste (and, if the test never touched the DB, non-obviously side-effecting).
+    if db_module._engine is not None:
+        await db_module._engine.dispose()
     db_module._engine = None
     db_module._async_session = None
     config_module._config_cache = None
@@ -89,14 +97,14 @@ class TestAuth:
     def test_connect_without_token_closes_4001(self, slim_app, isolated_db):
         client = TestClient(slim_app)
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with client.websocket_connect("/ws/acp"):
+            with client.websocket_connect("/api/acp/ws"):
                 pass
         assert exc_info.value.code == 4001
 
     async def test_connect_with_bad_token_closes_4001(self, slim_app, isolated_db):
         client = TestClient(slim_app)
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with client.websocket_connect("/ws/acp?token=not-a-real-token"):
+            with client.websocket_connect("/api/acp/ws?token=not-a-real-token"):
                 pass
         assert exc_info.value.code == 4001
 
@@ -106,7 +114,7 @@ class TestHandshakeAndSessionMapping:
         user_id, cookies = authed_user
         client = TestClient(slim_app, cookies=cookies)
 
-        with client.websocket_connect("/ws/acp") as ws:
+        with client.websocket_connect("/api/acp/ws") as ws:
             ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             init_response = ws.receive_json()
             assert init_response["result"]["authMethods"] == []
@@ -132,7 +140,7 @@ class TestHandshakeAndSessionMapping:
         user_id, cookies = authed_user
         client = TestClient(slim_app, cookies=cookies)
 
-        with client.websocket_connect("/ws/acp") as ws:
+        with client.websocket_connect("/api/acp/ws") as ws:
             ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             ws.receive_json()
             ws.send_json(
@@ -166,3 +174,142 @@ class TestHandshakeAndSessionMapping:
             )
             missing_response = ws.receive_json()
             assert missing_response["error"]["code"] == -32001
+
+    async def test_session_load_with_mismatched_cwd_returns_not_found(self, slim_app, authed_user):
+        """A chat's recorded workspace is honest state, not a hint: asking to load it
+        against a different `cwd` must fail exactly like an unknown session id, not
+        silently resume it against the wrong directory.
+        """
+        _user_id, cookies = authed_user
+        client = TestClient(slim_app, cookies=cookies)
+
+        with client.websocket_connect("/api/acp/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            ws.receive_json()
+            ws.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {"cwd": "/workspace/demo", "mcpServers": []},
+                }
+            )
+            session_id = ws.receive_json()["result"]["sessionId"]
+
+            ws.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/load",
+                    "params": {"sessionId": session_id, "cwd": "/workspace/other"},
+                }
+            )
+            response = ws.receive_json()
+            assert response["error"]["code"] == -32001
+
+
+class TestCrossUserIsolation:
+    async def test_user_b_cannot_load_user_as_session_and_user_a_still_can(
+        self, slim_app, isolated_db
+    ):
+        """The critical isolation gap: a session id is a UUID a client could plausibly
+        guess or be handed accidentally (e.g. shared logs), so ownership must be
+        enforced server-side, not just by unguessability. This must fail if
+        `ChatSessionBackend.load_session` ever drops its `chat.user_id != self.user_id`
+        check.
+        """
+        user_a_id = await User.create(
+            username="acp-user-a",
+            password_hash="unused-in-this-test",
+            role="user",
+            created_at=now_ms(),
+        )
+        user_b_id = await User.create(
+            username="acp-user-b",
+            password_hash="unused-in-this-test",
+            role="user",
+            created_at=now_ms(),
+        )
+        token_a = create_token(user_a_id, "acp-user-a", role="user")
+        token_b = create_token(user_b_id, "acp-user-b", role="user")
+
+        client_a = TestClient(slim_app, cookies={"cptr_session": token_a})
+        with client_a.websocket_connect("/api/acp/ws") as ws_a:
+            ws_a.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            ws_a.receive_json()
+            ws_a.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {"cwd": "/workspace/a-only", "mcpServers": []},
+                }
+            )
+            session_id = ws_a.receive_json()["result"]["sessionId"]
+
+        chat = await Chat.get_by_id(session_id)
+        assert chat is not None and chat.user_id == user_a_id
+
+        client_b = TestClient(slim_app, cookies={"cptr_session": token_b})
+        with client_b.websocket_connect("/api/acp/ws") as ws_b:
+            ws_b.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            ws_b.receive_json()
+            ws_b.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/load",
+                    "params": {"sessionId": session_id, "cwd": "/workspace/a-only"},
+                }
+            )
+            b_response = ws_b.receive_json()
+            assert b_response["error"]["code"] == -32001
+            # Indistinguishable from a nonexistent session: same code, same message.
+            assert b_response["error"]["message"] == "session not found"
+
+        # User A can still load their own session -- this isn't a general "loading is
+        # broken" bug, it's specifically an ownership check.
+        with client_a.websocket_connect("/api/acp/ws") as ws_a2:
+            ws_a2.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            ws_a2.receive_json()
+            ws_a2.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/load",
+                    "params": {"sessionId": session_id, "cwd": "/workspace/a-only"},
+                }
+            )
+            a_response = ws_a2.receive_json()
+            assert a_response["result"] == {}
+
+
+class TestMalformedFrames:
+    def test_non_json_text_frame_gets_parse_error_and_connection_survives(
+        self, slim_app, authed_user
+    ):
+        _user_id, cookies = authed_user
+        client = TestClient(slim_app, cookies=cookies)
+
+        with client.websocket_connect("/api/acp/ws") as ws:
+            ws.send_text("this is not json{{{")
+            response = ws.receive_json()
+            assert response["error"]["code"] == -32700
+
+            # The connection must still be usable for a normal request afterwards.
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            init_response = ws.receive_json()
+            assert init_response["result"]["agentInfo"]["name"] == "cptr"
+
+    def test_binary_frame_gets_parse_error_and_connection_survives(self, slim_app, authed_user):
+        _user_id, cookies = authed_user
+        client = TestClient(slim_app, cookies=cookies)
+
+        with client.websocket_connect("/api/acp/ws") as ws:
+            ws.send_bytes(b"\x00\x01\x02not-json-binary-garbage")
+            response = ws.receive_json()
+            assert response["error"]["code"] == -32700
+
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            init_response = ws.receive_json()
+            assert init_response["result"]["agentInfo"]["name"] == "cptr"

@@ -1,4 +1,4 @@
-"""Transport abstraction for ACP JSON-RPC clients.
+"""Transport abstraction for ACP JSON-RPC clients and servers.
 
 `AcpClient` (see `cptr/utils/agents/acp.py`) originally spoke JSON-RPC directly over a
 stdio subprocess. This module extracts that I/O boundary into an `AcpTransport`
@@ -6,6 +6,10 @@ protocol so the protocol logic in `AcpClient` can be exercised without spawning 
 process: `StdioSubprocessTransport` reproduces the original subprocess behavior exactly,
 while `InMemoryTransport` (via `connected_pair()`) lets tests wire a real `AcpClient`
 against a scripted "fake agent" coroutine using nothing but `asyncio.Queue`s.
+`WebSocketTransport` implements the same protocol on the server side, over an
+already-`accept()`ed Starlette/FastAPI `WebSocket` (see `cptr/routers/acp.py` and
+`cptr/utils/acp_server.py`), turning malformed inbound frames into `AcpParseError`
+instead of letting `json.loads`/ASGI-state errors escape as unhandled exceptions.
 
 Framing behavior (`extract_json_message`) is moved here byte-for-byte from the old
 `acp.py::_extract_json_message` and must keep its quirks: leading whitespace is
@@ -40,6 +44,13 @@ from typing import Any, Protocol
 
 class TransportClosed(Exception):
     """Raised by `AcpTransport.receive()` when the peer/stream has closed."""
+
+
+class AcpParseError(Exception):
+    """Raised by `AcpTransport.receive()` when a frame arrived but couldn't be parsed
+    into a JSON-RPC message (malformed JSON text, or a binary frame we don't support).
+    Distinct from `TransportClosed`: the connection is still open and usable.
+    """
 
 
 class AcpTransport(Protocol):
@@ -243,26 +254,54 @@ class WebSocketTransport:
 
     def __init__(self, websocket: Any) -> None:
         self.websocket = websocket
+        self._closed = False
 
     async def start(self) -> None:
         pass
 
     async def send(self, message: dict[str, Any]) -> None:
+        if self._closed:
+            raise ConnectionResetError("transport is closed")
         await self.websocket.send_text(json.dumps(message, separators=(",", ":")))
 
     async def receive(self) -> dict[str, Any]:
-        from starlette.websockets import WebSocketDisconnect
+        """Return one parsed JSON-RPC message.
 
+        Built on the raw ASGI message dict (`websocket.receive()`) rather than
+        `receive_text()`/`receive_json()`: those raise `WebSocketDisconnect` on a
+        disconnect message but raise `KeyError` (not something callers can react to
+        sanely) when the frame is binary, since they index straight into
+        `message["text"]`. Here every non-JSON-object outcome -- bad JSON text, or a
+        binary frame, which this protocol never uses -- becomes `AcpParseError` so the
+        connection can report a parse error and keep serving instead of crashing.
+        """
         try:
-            text = await self.websocket.receive_text()
-        except WebSocketDisconnect as exc:
-            raise TransportClosed("websocket disconnected") from exc
+            message = await self.websocket.receive()
         except RuntimeError as exc:
             # e.g. "Cannot call 'receive' once a disconnect message has been received."
             # -- raised when the client already went away and we try to read again.
             raise TransportClosed("websocket already closed") from exc
-        return json.loads(text)
+
+        if message["type"] == "websocket.disconnect":
+            raise TransportClosed("websocket disconnected")
+
+        text = message.get("text")
+        if text is not None:
+            try:
+                return json.loads(text)
+            except (ValueError, TypeError) as exc:
+                raise AcpParseError(f"invalid JSON text frame: {exc}") from exc
+
+        # Binary frame: ACP over this transport is JSON-text-only.
+        raise AcpParseError("binary frames are not supported")
 
     async def close(self) -> None:
-        with suppress(Exception):
+        if self._closed:
+            return
+        self._closed = True
+        # Starlette raises `RuntimeError` when asked to close a websocket whose
+        # ASGI application-state is already `DISCONNECTED` (e.g. the client went
+        # away and something already sent a close/response for it) -- the only
+        # error actually seen when double-closing in practice.
+        with suppress(RuntimeError):
             await self.websocket.close()

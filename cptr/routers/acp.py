@@ -1,8 +1,16 @@
 """ACP (Agent Client Protocol) server endpoint: exposes cptr as a network-reachable
-ACP agent over WebSocket. Auth mirrors `cptr/routers/events.py:events_ws` exactly --
-token from the `cptr_session` cookie or a `?token=` query param, checked with the
-same `check_access` used by the HTTP auth middleware, closing unauthenticated
-connections with code 4001 before ever accepting them.
+ACP agent over WebSocket. Auth mirrors `cptr/routers/events.py:events_ws` -- token
+from the `cptr_session` cookie or a `?token=` query param, checked with the same
+`check_access` used by the HTTP auth middleware, closing unauthenticated connections
+with code 4001 before ever accepting them -- plus one requirement `events_ws` doesn't
+have: `auth.user_id` must actually be set (not just `auth is not None`), since every
+ACP session is scoped to a user id via `ChatSessionBackend`.
+
+Note this is a WebSocket route: Starlette's HTTP-scoped middleware (including
+`cptr.app`'s `auth_middleware`, a `@app.middleware("http")` function) never runs for
+websocket-scope connections, so the `check_access` call below is the *only* auth
+check this endpoint gets -- it is not a redundant second check on top of the HTTP
+middleware.
 """
 
 from __future__ import annotations
@@ -17,15 +25,16 @@ from cptr.utils.config import check_access
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/api/acp", tags=["acp"])
 
 
-@router.websocket("/ws/acp")
+@router.websocket("/ws")
 async def acp_ws(websocket: WebSocket):
-    """ACP agent endpoint: initialize / authenticate / session/new / session/load.
-
-    `session/prompt` bridging and `session/cancel` land in step 3; for now they are
-    stubbed by `ChatSessionBackend` (see `cptr/utils/acp_server.py`).
+    """ACP agent endpoint (`/api/acp/ws`): initialize / authenticate / session/new /
+    session/load, with `session/prompt`/`session/cancel` gated by a per-connection
+    authorized-session set (see `cptr/utils/acp_server.py`). Real `session/prompt`
+    bridging into `run_chat_task` lands in step 3; for now it is stubbed by
+    `ChatSessionBackend`.
     """
     client_host = websocket.client.host if websocket.client else "127.0.0.1"
     token = websocket.cookies.get("cptr_session") or websocket.query_params.get("token")

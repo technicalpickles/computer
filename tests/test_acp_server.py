@@ -85,12 +85,24 @@ async def _teardown(client_transport, task):
     await client_transport.close()
     with contextlib_suppress():
         await asyncio.wait_for(task, timeout=2)
+    _assert_task_finished_cleanly(task)
 
 
 def contextlib_suppress():
     import contextlib
 
-    return contextlib.suppress(asyncio.CancelledError, TransportClosed, Exception)
+    return contextlib.suppress(asyncio.CancelledError, TransportClosed)
+
+
+def _assert_task_finished_cleanly(task: asyncio.Task) -> None:
+    """The narrowed `contextlib_suppress()` above only swallows expected shutdown
+    exceptions, so a `serve()` crash or a `wait_for` timeout now propagates instead of
+    silently passing the teardown. This asserts what "finished cleanly" actually means:
+    the task is done, and if it wasn't cancelled, it didn't end on an exception either.
+    """
+    assert task.done()
+    if not task.cancelled():
+        assert task.exception() is None
 
 
 async def _request(transport, request_id, method, params=None):
@@ -191,6 +203,55 @@ class TestSessionNew:
         assert backend.new_session_calls == []
         await _teardown(client_transport, task)
 
+    async def test_relative_cwd_is_invalid_params(self, wired):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        response = await _request(client_transport, 2, "session/new", {"cwd": "relative/path"})
+
+        assert response["error"]["code"] == -32602
+        assert backend.new_session_calls == []
+        await _teardown(client_transport, task)
+
+    async def test_cwd_with_dotdot_segment_is_invalid_params(self, wired):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        response = await _request(client_transport, 2, "session/new", {"cwd": "/workspace/../etc"})
+
+        assert response["error"]["code"] == -32602
+        assert backend.new_session_calls == []
+        await _teardown(client_transport, task)
+
+    async def test_oversized_cwd_is_invalid_params(self, wired):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        oversized_cwd = "/" + ("a" * 4096)
+        response = await _request(client_transport, 2, "session/new", {"cwd": oversized_cwd})
+
+        assert response["error"]["code"] == -32602
+        assert backend.new_session_calls == []
+        await _teardown(client_transport, task)
+
+    async def test_session_new_cap_enforced(self):
+        client_transport, server_transport = connected_pair()
+        backend = StubBackend()
+        connection = AcpServerConnection(server_transport, backend, session_new_cap=2)
+        task = asyncio.create_task(connection.serve())
+
+        await _request(client_transport, 1, "initialize", {})
+        first = await _request(client_transport, 2, "session/new", {"cwd": "/tmp"})
+        second = await _request(client_transport, 3, "session/new", {"cwd": "/tmp"})
+        third = await _request(client_transport, 4, "session/new", {"cwd": "/tmp"})
+
+        assert first["result"]["sessionId"] == "server-sess-1"
+        assert second["result"]["sessionId"] == "server-sess-1"
+        assert third["error"]["code"] == -32000
+        assert len(backend.new_session_calls) == 2
+
+        await _teardown(client_transport, task)
+
 
 class TestSessionLoad:
     async def test_found_returns_empty_object(self, wired):
@@ -242,6 +303,45 @@ class TestSessionPromptStub:
         await _teardown(client_transport, task)
 
 
+class TestAuthorizedSessionGate:
+    async def test_prompt_against_unauthorized_session_id_is_rejected_without_backend_call(
+        self, wired
+    ):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        response = await _request(
+            client_transport, 2, "session/prompt", {"sessionId": "not-mine", "prompt": []}
+        )
+
+        assert response["error"]["code"] == -32001
+        assert backend.prompt_calls == []
+        await _teardown(client_transport, task)
+
+    async def test_cancel_for_unauthorized_session_id_does_not_reach_backend(self, wired):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        await _notify(client_transport, "session/cancel", {"sessionId": "not-mine"})
+
+        await _assert_no_message(client_transport)
+        assert backend.cancel_calls == []
+        await _teardown(client_transport, task)
+
+    async def test_cancel_for_authorized_session_id_reaches_backend(self, wired):
+        client_transport, _server_transport, backend, _connection, task = wired
+
+        await _request(client_transport, 1, "initialize", {})
+        new_response = await _request(client_transport, 2, "session/new", {"cwd": "/tmp"})
+        session_id = new_response["result"]["sessionId"]
+
+        await _notify(client_transport, "session/cancel", {"sessionId": session_id})
+
+        await _assert_no_message(client_transport)
+        assert backend.cancel_calls == [session_id]
+        await _teardown(client_transport, task)
+
+
 class TestBackendExceptions:
     async def test_new_session_runtime_error_becomes_internal_error(self, wired):
         client_transport, _server_transport, backend, _connection, task = wired
@@ -251,7 +351,10 @@ class TestBackendExceptions:
         response = await _request(client_transport, 2, "session/new", {"cwd": "/tmp"})
 
         assert response["error"]["code"] == -32603
-        assert "boom" in response["error"]["message"]
+        # The exception text must never reach the client -- it can carry SQL/schema
+        # details or other server internals. Only the fixed, generic message goes out.
+        assert "boom" not in response["error"]["message"]
+        assert response["error"]["message"] == "internal error"
 
         # Connection survives: reset the error and retry successfully.
         backend.new_session_error = None
@@ -288,22 +391,61 @@ class TestDispatchEdgeCases:
         await _assert_no_message(client_transport)
         await _teardown(client_transport, task)
 
-    async def test_malformed_message_with_id_gets_error(self, wired):
+    async def test_malformed_message_with_id_gets_invalid_request_error(self, wired):
         client_transport, _server_transport, _backend, _connection, task = wired
 
         await client_transport.send({"jsonrpc": "2.0", "id": 7})
         response = await client_transport.receive()
 
         assert response["id"] == 7
-        assert response["error"]["code"] == -32601
+        assert response["error"]["code"] == -32600
         await _teardown(client_transport, task)
 
-    async def test_malformed_message_without_id_is_ignored(self, wired):
+    async def test_malformed_message_without_id_gets_null_id_error(self, wired):
         client_transport, _server_transport, _backend, _connection, task = wired
 
         await client_transport.send({"jsonrpc": "2.0"})
+        response = await client_transport.receive()
 
+        # A message missing `method` is invalid regardless of whether it looks like a
+        # notification -- there's no method to know it was even meant as one, so it
+        # always gets answered, with `id: null` since none was supplied.
+        assert response["id"] is None
+        assert response["error"]["code"] == -32600
+        await _teardown(client_transport, task)
+
+    async def test_batch_array_message_gets_single_invalid_request_error(self, wired):
+        client_transport, _server_transport, _backend, _connection, task = wired
+
+        await client_transport.send(
+            [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
+        )
+        response = await client_transport.receive()
+
+        assert response["id"] is None
+        assert response["error"]["code"] == -32600
         await _assert_no_message(client_transport)
+        await _teardown(client_transport, task)
+
+    async def test_zero_request_id_round_trips_exact_type(self, wired):
+        client_transport, _server_transport, _backend, _connection, task = wired
+
+        response = await _request(client_transport, 0, "initialize", {})
+
+        assert response["id"] == 0
+        assert type(response["id"]) is int
+        await _teardown(client_transport, task)
+
+    async def test_null_request_id_present_gets_response_with_null_id(self, wired):
+        client_transport, _server_transport, _backend, _connection, task = wired
+
+        await client_transport.send(
+            {"jsonrpc": "2.0", "id": None, "method": "initialize", "params": {}}
+        )
+        response = await client_transport.receive()
+
+        assert response["id"] is None
+        assert response["result"]["agentInfo"]["name"] == "cptr"
         await _teardown(client_transport, task)
 
 
@@ -338,6 +480,7 @@ class TestDogfoodWithRealAcpClient:
             server_task.cancel()
         with contextlib_suppress():
             await asyncio.wait_for(server_task, timeout=2)
+        _assert_task_finished_cleanly(server_task)
 
     async def test_resume_path_keeps_session_id_when_load_succeeds(self):
         client_transport, server_transport = connected_pair()
@@ -365,6 +508,7 @@ class TestDogfoodWithRealAcpClient:
             server_task.cancel()
         with contextlib_suppress():
             await asyncio.wait_for(server_task, timeout=2)
+        _assert_task_finished_cleanly(server_task)
 
     async def test_resume_path_falls_back_to_session_new_when_load_fails(self):
         client_transport, server_transport = connected_pair()
@@ -392,3 +536,4 @@ class TestDogfoodWithRealAcpClient:
             server_task.cancel()
         with contextlib_suppress():
             await asyncio.wait_for(server_task, timeout=2)
+        _assert_task_finished_cleanly(server_task)

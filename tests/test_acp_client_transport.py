@@ -398,3 +398,73 @@ class TestPrompt:
 
         await client.close()
         await agent.stop()
+
+
+class TestPendingIdMatching:
+    """`_handle_message` pops `self.pending` using `message["id"]` as-is. `AcpClient`
+    itself only ever generates integer ids via `self.next_id`, so a real agent
+    conversation never exercises the string-id branch of `pending.pop(...)` -- this
+    test seeds `client.pending` directly to pin that non-integer ids resolve their
+    matching future (and don't disturb an int-keyed sibling), which would fail if the
+    pop ever coerced the id with e.g. `int(message["id"])`.
+    """
+
+    async def test_response_with_string_id_resolves_matching_future_only(self, transports):
+        client_transport, agent_transport = transports
+        agent = FakeAgent(agent_transport)
+        await _default_handshake(agent)
+        agent.start()
+
+        client = make_client(client_transport)
+        await client.start()
+
+        loop = asyncio.get_running_loop()
+        string_future: asyncio.Future = loop.create_future()
+        int_future: asyncio.Future = loop.create_future()
+        client.pending["req-string-id"] = string_future
+        client.pending[999] = int_future
+
+        await agent.transport.send(
+            {"jsonrpc": "2.0", "id": "req-string-id", "result": {"ok": True}}
+        )
+
+        response = await asyncio.wait_for(string_future, timeout=2)
+        assert response == {"jsonrpc": "2.0", "id": "req-string-id", "result": {"ok": True}}
+
+        # The int-keyed sibling must be untouched: still registered, still pending.
+        assert client.pending.get(999) is int_future
+        assert not int_future.done()
+        assert "req-string-id" not in client.pending
+
+        await client.close()
+        await agent.stop()
+
+
+class TestCloseCancelsReaderAndPending:
+    async def test_close_cancels_reader_task_and_pending_request_while_peer_alive(self, transports):
+        client_transport, agent_transport = transports
+        agent = FakeAgent(agent_transport)
+        await _default_handshake(agent)
+        agent.start()
+
+        client = make_client(client_transport)
+        await client.start()
+
+        # Peer stays alive throughout -- this pins that `close()` itself cancels the
+        # reader task and pending futures, not that they resolve via peer closure.
+        pending = asyncio.ensure_future(client.request("custom/never_answered", {}))
+        await asyncio.sleep(0.01)  # let the request actually reach `self.pending`
+
+        assert client.reader_task is not None
+        assert not client.reader_task.done()
+
+        await asyncio.wait_for(client.close(), timeout=2)
+
+        assert client.reader_task.done()
+        assert client.reader_task.cancelled()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=2)
+        assert pending.cancelled()
+
+        await agent.stop()

@@ -12,7 +12,6 @@ from cptr.utils.agents.acp_transport import (
     AcpTransport,
     StdioSubprocessTransport,
     TransportClosed,
-    extract_json_message,
 )
 
 
@@ -205,10 +204,6 @@ class AcpClient:
         )
         assert self.transport is not None
         await self.transport.send({"jsonrpc": "2.0", "id": request_id, "result": outcome})
-
-
-# Backward-compat alias: nothing external imports this, but keep it in case something does.
-_extract_json_message = extract_json_message
 
 
 def _extract_model_config_id(setup: dict[str, Any]) -> str | None:

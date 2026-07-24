@@ -95,7 +95,7 @@ def extract_json_message(buffer: bytes) -> tuple[dict[str, Any], bytes] | None:
 _CLOSED_SENTINEL = object()
 
 
-class StdioSubprocessTransport(AcpTransport):
+class StdioSubprocessTransport:
     """ACP transport backed by a stdio subprocess (the original `AcpClient` behavior)."""
 
     def __init__(self, command: str, args: list[str], cwd: str, env: dict[str, str]) -> None:
@@ -146,45 +146,65 @@ class StdioSubprocessTransport(AcpTransport):
         for task in (self._reader_task, self._stderr_task):
             if task:
                 task.cancel()
-                with suppress(asyncio.CancelledError):
+                # `.cancel()` only requests cancellation; awaiting the task can still
+                # surface whatever exception it was in the middle of raising (e.g. a
+                # `ValueError` from an oversized `readline()`), not just
+                # `CancelledError`. `close()` must complete regardless so the caller's
+                # pending-future cleanup always runs.
+                with suppress(BaseException):
                     await task
 
     async def _reader_loop(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
         buffer = b""
-        while True:
-            chunk = await self.proc.stdout.read(4096)
-            if not chunk:
-                break
-            buffer += chunk
+        try:
             while True:
-                extracted = extract_json_message(buffer)
-                if extracted is None:
+                chunk = await self.proc.stdout.read(4096)
+                if not chunk:
                     break
-                message, buffer = extracted
-                await self._queue.put(message)
-        await self._queue.put(_CLOSED_SENTINEL)
+                buffer += chunk
+                while True:
+                    extracted = extract_json_message(buffer)
+                    if extracted is None:
+                        break
+                    message, buffer = extracted
+                    await self._queue.put(message)
+        finally:
+            # Deliver the EOF sentinel even if the loop above dies on an exception
+            # (e.g. malformed JSON from the agent), so `receive()` never hangs.
+            await self._queue.put(_CLOSED_SENTINEL)
 
     async def _stderr_loop(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
-        while await self.proc.stderr.readline():
+        # Drain with bounded reads rather than `readline()`: a single stderr line
+        # longer than the stream's line-length limit makes `readline()` raise
+        # `ValueError`, which used to propagate out of `close()` and skip
+        # `AcpClient`'s pending-future cleanup.
+        while await self.proc.stderr.read(65536):
             pass
 
 
-class InMemoryTransport(AcpTransport):
+class InMemoryTransport:
     """In-memory `AcpTransport` for tests: cross-wire two via `connected_pair()`."""
 
-    def __init__(self, outgoing: asyncio.Queue[Any], incoming: asyncio.Queue[Any]) -> None:
+    def __init__(
+        self,
+        outgoing: asyncio.Queue[Any],
+        incoming: asyncio.Queue[Any],
+        closed: list[bool],
+    ) -> None:
         self._outgoing = outgoing
         self._incoming = incoming
-        self._closed = False
+        # Shared with the peer transport created by the same `connected_pair()` call,
+        # so closing either side is immediately visible to `send()` on both sides.
+        self._closed = closed
 
     async def start(self) -> None:
         pass
 
     async def send(self, message: dict[str, Any]) -> None:
-        if self._closed:
-            raise TransportClosed("transport is closed")
+        if self._closed[0]:
+            raise ConnectionResetError("transport is closed")
         await self._outgoing.put(message)
 
     async def receive(self) -> dict[str, Any]:
@@ -195,15 +215,19 @@ class InMemoryTransport(AcpTransport):
         return item
 
     async def close(self) -> None:
-        if self._closed:
+        if self._closed[0]:
             return
-        self._closed = True
+        self._closed[0] = True
+        # Unblock a peer parked in `receive()` *and* our own side, in case we're the
+        # one with a pending `receive()` call: put the sentinel on both queues.
         await self._outgoing.put(_CLOSED_SENTINEL)
+        await self._incoming.put(_CLOSED_SENTINEL)
 
 
 def connected_pair() -> tuple[InMemoryTransport, InMemoryTransport]:
     queue_a: asyncio.Queue[Any] = asyncio.Queue()
     queue_b: asyncio.Queue[Any] = asyncio.Queue()
-    side_a = InMemoryTransport(outgoing=queue_a, incoming=queue_b)
-    side_b = InMemoryTransport(outgoing=queue_b, incoming=queue_a)
+    closed = [False]
+    side_a = InMemoryTransport(outgoing=queue_a, incoming=queue_b, closed=closed)
+    side_b = InMemoryTransport(outgoing=queue_b, incoming=queue_a, closed=closed)
     return side_a, side_b

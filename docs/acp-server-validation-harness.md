@@ -187,3 +187,38 @@ Each step lands with its slice of the matrix green; Tier 2 golden transcripts fl
   stdio/WS traffic from one real Zed session once, replay it as a Tier 2 scenario
   forever) turns even editor validation into a regression test after a single manual
   capture.
+
+---
+
+## 6. Decision log & accepted risks (updated as steps land)
+
+Decisions made while implementing (with adversarial review at each step):
+
+- **Step 1 (landed):** transport seam (`AcpTransport`; stdio/in-memory/WebSocket
+  implementations), `AcpClient` refactored onto it, Tier 0 suite. Smoke testing at the
+  adapter layer exposed and fixed a latent pre-existing race shared by all four ACP
+  adapters (turn loop hung when the agent's final events and prompt response arrived in
+  one read burst) — replaced with `acp_turn_event_stream`.
+- **Step 2 (landed):** `AcpServerConnection` + `ChatSessionBackend` + `/api/acp/ws`.
+  ACP `sessionId` == `Chat.id`; `cwd` → `meta.workspace` (validated: absolute, no `..`,
+  bounded length). `initialize` advertises **empty `authMethods`** — auth happens at
+  the WS layer before the protocol starts; advertising methods you don't implement is
+  a real interop bug (observed live against Zed's claude-code-acp, which advertises
+  auth methods it errors on, breaking our own client's eager-authenticate handshake —
+  our client tolerates it server-side by replying `{}` to `authenticate` regardless).
+  Per-connection authorized-session set gates `session/prompt`/`session/cancel`;
+  unauthorized ids are indistinguishable from nonexistent (`-32001`). Internal errors
+  return a fixed string (no `str(exc)` — it leaked SQL/schema in review). Parse
+  errors/binary frames → `-32700`, connection survives.
+
+Accepted risks / systemic notes (inherited from existing app patterns, flagged during
+step 2 review — revisit before any public exposure):
+
+- Auth is validated once at WS connect (same as `events_ws`); JWT-secret rotation or
+  role demotion does not terminate live connections, and `verify_token` does no DB
+  read. Consider per-request revalidation or capping connection lifetime at token
+  expiry before this endpoint drives agent execution (step 3+).
+- `?token=` query-param auth (events_ws precedent) puts tokens in access/proxy logs.
+- No role gate beyond authentication; matches the rest of the app.
+- Protocol version is not negotiated — the server always answers `protocolVersion: 1`
+  (consistent with ACP: the agent picks).

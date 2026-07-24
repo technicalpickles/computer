@@ -8,6 +8,13 @@ import os
 from contextlib import suppress
 from typing import Any, AsyncIterator
 
+from cptr.utils.agents.acp_transport import (
+    AcpTransport,
+    StdioSubprocessTransport,
+    TransportClosed,
+    extract_json_message,
+)
+
 
 class AcpClient:
     def __init__(
@@ -21,6 +28,7 @@ class AcpClient:
         client_capabilities: dict[str, Any] | None = None,
         resume_session_id: str | None = None,
         auto_approve_permissions: bool = False,
+        transport: AcpTransport | None = None,
     ) -> None:
         self.command = command
         self.args = args
@@ -30,9 +38,8 @@ class AcpClient:
         self.client_capabilities = client_capabilities or {}
         self.resume_session_id = resume_session_id
         self.auto_approve_permissions = auto_approve_permissions
-        self.proc: asyncio.subprocess.Process | None = None
+        self.transport = transport
         self.reader_task: asyncio.Task | None = None
-        self.stderr_task: asyncio.Task | None = None
         self.pending: dict[Any, asyncio.Future[dict[str, Any]]] = {}
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.next_id = 1
@@ -42,17 +49,12 @@ class AcpClient:
         self.model_config_id: str | None = None
 
     async def start(self) -> None:
-        self.proc = await asyncio.create_subprocess_exec(
-            self.command,
-            *self.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd or os.getcwd(),
-            env=self.env,
-        )
+        if self.transport is None:
+            self.transport = StdioSubprocessTransport(
+                self.command, self.args, self.cwd or os.getcwd(), self.env
+            )
+        await self.transport.start()
         self.reader_task = asyncio.create_task(self._reader_loop())
-        self.stderr_task = asyncio.create_task(self._stderr_loop())
         self.initialize_result = await self.request(
             "initialize",
             {
@@ -71,18 +73,12 @@ class AcpClient:
         await self._open_session()
 
     async def close(self) -> None:
-        if self.proc and self.proc.returncode is None:
-            self.proc.terminate()
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.proc.wait(), timeout=3)
-            if self.proc.returncode is None:
-                self.proc.kill()
-                await self.proc.wait()
-        for task in (self.reader_task, self.stderr_task):
-            if task:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+        if self.reader_task:
+            self.reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.reader_task
+        if self.transport:
+            await self.transport.close()
         for future in self.pending.values():
             if not future.done():
                 future.cancel()
@@ -94,7 +90,10 @@ class AcpClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self.pending[request_id] = future
-        await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        assert self.transport is not None
+        await self.transport.send(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        )
         response = await future
         if "error" in response:
             raise RuntimeError(str(response["error"]))
@@ -102,7 +101,8 @@ class AcpClient:
         return result if isinstance(result, dict) else {}
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
-        await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        assert self.transport is not None
+        await self.transport.send({"jsonrpc": "2.0", "method": method, "params": params})
 
     async def prompt(self, text: str, images: list[dict[str, str]] | None = None) -> dict[str, Any]:
         if not self.session_id:
@@ -165,31 +165,14 @@ class AcpClient:
         self.setup_result = setup
         self.model_config_id = _extract_model_config_id(setup)
 
-    async def _send(self, payload: dict[str, Any]) -> None:
-        assert self.proc is not None and self.proc.stdin is not None
-        data = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
-        self.proc.stdin.write(data)
-        await self.proc.stdin.drain()
-
     async def _reader_loop(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        buffer = b""
+        assert self.transport is not None
         while True:
-            chunk = await self.proc.stdout.read(4096)
-            if not chunk:
+            try:
+                message = await self.transport.receive()
+            except TransportClosed:
                 break
-            buffer += chunk
-            while True:
-                extracted = _extract_json_message(buffer)
-                if extracted is None:
-                    break
-                message, buffer = extracted
-                await self._handle_message(message)
-
-    async def _stderr_loop(self) -> None:
-        assert self.proc is not None and self.proc.stderr is not None
-        while await self.proc.stderr.readline():
-            pass
+            await self._handle_message(message)
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         if (
@@ -220,45 +203,12 @@ class AcpClient:
             if option_id
             else {"outcome": {"outcome": "cancelled"}}
         )
-        await self._send({"jsonrpc": "2.0", "id": request_id, "result": outcome})
+        assert self.transport is not None
+        await self.transport.send({"jsonrpc": "2.0", "id": request_id, "result": outcome})
 
 
-def _extract_json_message(buffer: bytes) -> tuple[dict[str, Any], bytes] | None:
-    stripped = buffer.lstrip()
-    skipped = len(buffer) - len(stripped)
-    if skipped:
-        buffer = stripped
-
-    lower = buffer[:32].lower()
-    if lower.startswith(b"content-length:"):
-        header_end = buffer.find(b"\r\n\r\n")
-        sep_len = 4
-        if header_end < 0:
-            header_end = buffer.find(b"\n\n")
-            sep_len = 2
-        if header_end < 0:
-            return None
-        header = buffer[:header_end].decode(errors="replace")
-        length = None
-        for line in header.splitlines():
-            if line.lower().startswith("content-length:"):
-                with suppress(ValueError):
-                    length = int(line.split(":", 1)[1].strip())
-        if length is None:
-            raise RuntimeError("ACP message missing Content-Length")
-        start = header_end + sep_len
-        end = start + length
-        if len(buffer) < end:
-            return None
-        return json.loads(buffer[start:end].decode()), buffer[end:]
-
-    line_end = buffer.find(b"\n")
-    if line_end < 0:
-        return None
-    line = buffer[:line_end].strip()
-    if not line:
-        return {}, buffer[line_end + 1 :]
-    return json.loads(line.decode()), buffer[line_end + 1 :]
+# Backward-compat alias: nothing external imports this, but keep it in case something does.
+_extract_json_message = extract_json_message
 
 
 def _extract_model_config_id(setup: dict[str, Any]) -> str | None:

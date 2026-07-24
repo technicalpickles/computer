@@ -50,7 +50,7 @@ class TestNdjson:
         partial = b'{"jsonrpc": "2.0", "id": 1'
         assert extract_json_message(partial) is None
         # Completing the line (with the newline) makes it parseable.
-        complete = partial + b'}\n'
+        complete = partial + b"}\n"
         result = extract_json_message(complete)
         assert result is not None
         message, rest = result
@@ -58,26 +58,44 @@ class TestNdjson:
         assert rest == b""
 
     def test_leading_whitespace_is_stripped(self):
+        # `bytes.lstrip()` treats embedded "\n" as whitespace too, so a leading
+        # blank-ish run (spaces + newlines) is consumed wholesale and the real
+        # message underneath comes back directly -- not as a separate {} entry.
         buffer = b"   \n" + _ndjson({"id": 1})
         result = extract_json_message(buffer)
         assert result is not None
         message, rest = result
-        # The leading blank line, once whitespace is lstripped, becomes the first
-        # newline-terminated (empty) line -> {}.
-        assert message == {}
+        assert message == {"id": 1}
+        assert rest == b""
 
-    def test_blank_line_yields_empty_dict(self):
+    def test_blank_line_between_messages_is_silently_absorbed(self):
+        # A stray blank line ("\n\n") between two NDJSON messages never surfaces as
+        # its own {} extraction: lstrip() at the top of extract_json_message eats
+        # the blank line (and any other leading whitespace) before the "first
+        # line" scan runs, so the *next* real message is returned directly.
         buffer = b"\n" + _ndjson({"id": 1})
         result = extract_json_message(buffer)
         assert result is not None
         message, rest = result
-        assert message == {}
-        # The remaining buffer still has the real message queued up.
-        next_result = extract_json_message(rest)
-        assert next_result is not None
-        next_message, next_rest = next_result
-        assert next_message == {"id": 1}
-        assert next_rest == b""
+        assert message == {"id": 1}
+        assert rest == b""
+
+    def test_blank_line_yields_empty_dict_is_unreachable(self):
+        # The `if not line: return {}, ...` branch exists in the source but cannot
+        # be reached through the public function: by the time the newline scan
+        # runs, buffer[0] is guaranteed non-whitespace (or the buffer is empty),
+        # so `line` can never be blank. This test pins that finding as executable
+        # documentation rather than asserting the unreachable behavior.
+        import itertools
+
+        whitespace = [b" ", b"\n", b"\r", b"\t"]
+        for n in range(0, 6):
+            for combo in itertools.product(whitespace, repeat=n):
+                buffer = b"".join(combo) + b'{"id":1}\n'
+                result = extract_json_message(buffer)
+                assert result is not None
+                message, _rest = result
+                assert message == {"id": 1}, f"expected real message, got {message!r}"
 
     def test_only_whitespace_returns_none(self):
         # Nothing but spaces, no trailing newline: lstrip leaves an empty buffer,

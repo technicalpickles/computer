@@ -8,10 +8,22 @@ while `InMemoryTransport` (via `connected_pair()`) lets tests wire a real `AcpCl
 against a scripted "fake agent" coroutine using nothing but `asyncio.Queue`s.
 
 Framing behavior (`extract_json_message`) is moved here byte-for-byte from the old
-`acp.py::_extract_json_message` and must keep its quirks: leading whitespace/blank
-lines are stripped before sniffing the frame kind, a blank NDJSON line yields `{}`
-(not `None` and not "keep waiting"), and a `Content-Length` header present but missing
-a valid integer value raises `RuntimeError` rather than returning `None`.
+`acp.py::_extract_json_message` and must keep its quirks: leading whitespace is
+stripped (via `bytes.lstrip()`, which also treats embedded `\n`/`\r` as whitespace)
+before sniffing the frame kind, and a `Content-Length` header present but missing a
+valid integer value raises `RuntimeError` rather than returning `None`.
+
+The code has an `if not line: return {}, ...` branch intended to turn a "blank NDJSON
+line" into an empty-dict message. In practice this branch is unreachable through the
+public function: the unconditional `buffer.lstrip()` at the top of the function always
+consumes a full run of leading whitespace, and `\n` is itself whitespace, so any blank
+line sitting at the front of `buffer` is absorbed by that lstrip before the "first
+line" scan ever runs (post-lstrip, `buffer[0]` is always non-whitespace unless the
+buffer is now empty). A stray blank line between two NDJSON messages therefore never
+surfaces as a distinct `{}` message on its own extraction pass -- it is silently
+skipped, and the *next* real JSON message is returned directly. `tests/test_acp_framing.py`
+pins this exact (if slightly surprising) behavior instead of asserting the unreachable
+branch.
 
 Behavioral choice — blank-line `{}` messages: the original `_reader_loop` handled every
 extracted message (including `{}`) via `_handle_message`, which routes anything without

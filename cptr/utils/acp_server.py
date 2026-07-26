@@ -6,26 +6,32 @@ the JSON-RPC conversation over any `AcpTransport`, dispatching onto an injectabl
 `SessionBackend` so the protocol logic here is fully unit-testable without a database
 or a real WebSocket (see `tests/test_acp_server.py`).
 
-Step 2 of the build order (docs/acp-server-validation-harness.md): `initialize`,
+Step 2 of the build order (docs/acp-server-validation-harness.md) landed: `initialize`,
 `authenticate`, `session/new` (validated: absolute `cwd`, no `..` segments, bounded
 length, capped call count per connection), `session/load` (ownership + workspace
 match). `session/prompt`/`session/cancel` are gated by a per-connection
 authorized-session set so a connection can only ever act on sessions it created or
 loaded itself; unauthorized ids are indistinguishable from nonexistent (`-32001`).
-`session/prompt` bridging into `run_chat_task` and real `session/cancel` semantics
-land in step 3 -- here they are stubbed (`SessionBackend.prompt` raises
-`NotImplementedError`, `cancel` is a no-op hook).
+
+Step 3 lands here: `session/prompt` bridges into `run_chat_task` (`ChatSessionBackend`)
+and real `session/cancel` semantics. Prompt handling runs on a background
+`asyncio.Task` per session so the serve loop stays live to receive `session/cancel`
+mid-turn -- see `AcpServerConnection._dispatch_prompt` / `_cancel_all_prompts`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import posixpath
-from typing import Any, Protocol
+from contextlib import suppress
+from typing import Any, Awaitable, Callable, Protocol
 
 from cptr.utils.agents.acp_transport import AcpParseError, AcpTransport, TransportClosed
 
 logger = logging.getLogger(__name__)
+
+NotifyFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 PROTOCOL_VERSION = 1
 
@@ -55,8 +61,17 @@ class SessionBackend(Protocol):
         """Resume an existing session. False means unknown/forbidden."""
         ...
 
-    async def prompt(self, session_id: str, prompt_items: list[dict[str, Any]]) -> dict[str, Any]:
-        """Run one prompt turn. Step 2 stub: raise `NotImplementedError`."""
+    async def prompt(
+        self, session_id: str, prompt_items: list[dict[str, Any]], notify: NotifyFn
+    ) -> dict[str, Any]:
+        """Run one prompt turn, calling `notify(update)` for each `session/update`
+        the connection should send while the turn is in flight. Returns the
+        `session/prompt` JSON-RPC result (e.g. `{"stopReason": "end_turn"}`).
+
+        Raise `PromptRejected(message)` for a safe, user-facing rejection (e.g. no
+        model configured); any other exception becomes a generic internal error to
+        the client (never `str(exc)` -- full detail stays server-side).
+        """
         ...
 
     async def cancel(self, session_id: str) -> None:
@@ -73,12 +88,26 @@ class _JsonRpcError(Exception):
         self.message = message
 
 
+class PromptRejected(Exception):
+    """Raised by `SessionBackend.prompt` for a safe, static, user-facing rejection
+    reason (e.g. "no model configured", "empty prompt"). Never wrap arbitrary
+    exception text in this -- `message` is sent to the client verbatim as the
+    JSON-RPC error message.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 class AcpServerConnection:
     """Drives one ACP connection over an `AcpTransport` against a `SessionBackend`.
 
     `serve()` loops `transport.receive()` until `TransportClosed`, dispatching each
-    message sequentially. Dispatch lives in `_handle_request` as a single method so
-    step 3 can move prompt handling onto a background task without rewriting the loop.
+    message sequentially -- except `session/prompt`, which `_dispatch_prompt` hands
+    off to a background `asyncio.Task` (see `_prompt_tasks`) so a long-running turn
+    never blocks the loop from handling `session/cancel` (or anything else) in the
+    meantime. Every other method still goes through `_handle_request` synchronously.
 
     Tracks two pieces of per-connection state that are *not* the backend's concern:
     a count of `session/new` calls (bounded by `session_new_cap`, protecting the
@@ -104,23 +133,34 @@ class AcpServerConnection:
         self._session_new_cap = session_new_cap
         self._session_new_count = 0
         self._authorized_sessions: set[str] = set()
+        # One in-flight `session/prompt` task per session id. Tracked here (not just
+        # inside the backend) so the connection itself can reject a second concurrent
+        # prompt for the same session without ever reaching the backend, and so a
+        # disconnect can find and clean up every still-running prompt.
+        self._prompt_tasks: dict[str, asyncio.Task] = {}
 
     async def serve(self) -> None:
-        while True:
-            try:
-                message = await self.transport.receive()
-            except TransportClosed:
-                return
-            except AcpParseError:
-                await self.transport.send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": _ERR_PARSE_ERROR, "message": "parse error"},
-                    }
-                )
-                continue
-            await self._handle_message(message)
+        try:
+            while True:
+                try:
+                    message = await self.transport.receive()
+                except TransportClosed:
+                    return
+                except AcpParseError:
+                    await self.transport.send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {"code": _ERR_PARSE_ERROR, "message": "parse error"},
+                        }
+                    )
+                    continue
+                await self._handle_message(message)
+        finally:
+            # A disconnected client must not leave a turn running forever: cancel
+            # every in-flight prompt for this connection and make sure the backend
+            # actually stops the underlying work (not just our local bookkeeping).
+            await self._cancel_all_prompts()
 
     async def _handle_message(self, message: Any) -> None:
         if not isinstance(message, dict):
@@ -150,6 +190,14 @@ class AcpServerConnection:
         if not isinstance(params, dict):
             params = {}
 
+        if method == "session/prompt":
+            # Dispatched onto a background task (never awaited here) so the serve
+            # loop stays live to receive `session/cancel` for this same session (or
+            # `session/prompt`/anything else for a different one) while this turn
+            # runs. The task itself sends the eventual JSON-RPC response.
+            await self._dispatch_prompt(request_id, has_id, params)
+            return
+
         try:
             result = await self._handle_request(method, params)
         except _JsonRpcError as exc:
@@ -167,6 +215,99 @@ class AcpServerConnection:
         if has_id:
             await self.transport.send({"jsonrpc": "2.0", "id": request_id, "result": result})
         # Notifications (no id) never get a response, even on success.
+
+    async def _dispatch_prompt(self, request_id: Any, has_id: bool, params: dict[str, Any]) -> None:
+        if not self._initialized:
+            if has_id:
+                await self._send_error(request_id, _ERR_NOT_INITIALIZED, "not initialized")
+            return
+
+        session_id = params.get("sessionId")
+        prompt_items = params.get("prompt")
+        if not isinstance(prompt_items, list):
+            prompt_items = []
+        # Same error as "not found": an id this connection never created/loaded is
+        # indistinguishable from one that doesn't exist at all, whether or not the
+        # backend would actually recognize it.
+        if not isinstance(session_id, str) or session_id not in self._authorized_sessions:
+            if has_id:
+                await self._send_error(request_id, _ERR_SESSION_NOT_FOUND, "session not found")
+            return
+
+        if session_id in self._prompt_tasks:
+            if has_id:
+                await self._send_error(request_id, _ERR_SESSION_LIMIT, "prompt already in progress")
+            return
+
+        async def notify(update: dict[str, Any]) -> None:
+            await self.transport.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": session_id, "update": update},
+                }
+            )
+
+        async def run() -> None:
+            error: tuple[int, str] | None = None
+            result: dict[str, Any] = {}
+            try:
+                result = await self.backend.prompt(session_id, prompt_items, notify)
+            except NotImplementedError:
+                error = (_ERR_METHOD_NOT_FOUND, "session/prompt not supported yet")
+            except PromptRejected as exc:
+                error = (_ERR_SESSION_LIMIT, exc.message)
+            except Exception:  # noqa: BLE001 - never let a prompt task die unhandled
+                logger.exception(
+                    "ACP server: unhandled error in session/prompt for session %s", session_id
+                )
+                error = (_ERR_INTERNAL, "internal error")
+            finally:
+                self._prompt_tasks.pop(session_id, None)
+
+            if not has_id:
+                return
+            try:
+                if error is not None:
+                    await self._send_error(request_id, *error)
+                else:
+                    await self.transport.send(
+                        {"jsonrpc": "2.0", "id": request_id, "result": result}
+                    )
+            except Exception:
+                # The connection is gone by the time we tried to answer -- there's
+                # nothing left to report back to, and this must never surface as an
+                # unretrieved task exception.
+                logger.debug(
+                    "ACP server: failed to deliver session/prompt response for %s",
+                    session_id,
+                    exc_info=True,
+                )
+
+        self._prompt_tasks[session_id] = asyncio.create_task(run())
+
+    async def _cancel_all_prompts(self) -> None:
+        session_ids = list(self._prompt_tasks.keys())
+        for session_id in session_ids:
+            # Ask the backend to actually stop the underlying work first: this is
+            # what makes the prompt task's own consumption loop unwind and return
+            # normally (with a `cancelled` stopReason) instead of needing to be
+            # force-cancelled below.
+            with suppress(Exception):
+                await self.backend.cancel(session_id)
+
+        for session_id in session_ids:
+            task = self._prompt_tasks.get(session_id)
+            if task is None:
+                continue
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            except Exception:
+                if not task.done():
+                    task.cancel()
+                with suppress(BaseException):
+                    await task
+        self._prompt_tasks.clear()
 
     async def _handle_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "initialize":
@@ -218,22 +359,10 @@ class AcpServerConnection:
             self._authorized_sessions.add(session_id)
             return {}
 
-        if method == "session/prompt":
-            session_id = params.get("sessionId")
-            prompt_items = params.get("prompt")
-            if not isinstance(prompt_items, list):
-                prompt_items = []
-            # Same error as "not found": an id this connection never created/loaded is
-            # indistinguishable from one that doesn't exist at all, whether or not the
-            # backend would actually recognize it.
-            if not isinstance(session_id, str) or session_id not in self._authorized_sessions:
-                raise _JsonRpcError(_ERR_SESSION_NOT_FOUND, "session not found")
-            try:
-                return await self.backend.prompt(session_id, prompt_items)
-            except NotImplementedError:
-                raise _JsonRpcError(
-                    _ERR_METHOD_NOT_FOUND, "session/prompt not supported yet"
-                ) from None
+        # `session/prompt` is dispatched in `_handle_message`/`_dispatch_prompt`
+        # before it ever reaches here (it runs on a background task so the serve
+        # loop stays live for `session/cancel`); it is never routed through this
+        # method.
 
         if method == "session/cancel":
             session_id = params.get("sessionId")
@@ -266,32 +395,153 @@ class AcpServerConnection:
         )
 
 
+# ── Translation: internal `run_chat_task` output_queue items → ACP updates ──
+#
+# Pure, unit-testable mirror of the client-side parsers in `cptr/utils/agents/acp.py`
+# (`acp_text_from_update`/`acp_tool_from_update`): those consume `session/update`
+# `update` objects, these produce them. `ChatSessionBackend.prompt` calls
+# `acp_updates_from_queue_item` for every item pulled off the `output_queue` that
+# `run_chat_task.emit()` feeds (see `cptr/utils/chat_task.py`), same shape the
+# OpenAI-compat gateway consumes in `cptr/routers/gateway.py:_stream`/`_collect`.
+
+_TOOL_CALL_STATUSES = {"pending", "in_progress", "completed", "failed"}
+_PENDING_TOOL_CALL_STATUSES = {"pending", "in_progress"}
+
+
+def acp_updates_from_queue_item(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map one `output_queue` item (as pushed by `run_chat_task.emit()`) onto zero or
+    more ACP `session/update` `update` objects.
+    """
+    item_type = item.get("type")
+
+    if item_type == "delta":
+        text = item.get("content")
+        if not isinstance(text, str) or not text:
+            return []
+        return [{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}]
+
+    if item_type == "output":
+        inner = item.get("item")
+        if not isinstance(inner, dict):
+            return []
+        return _acp_updates_from_output_item(inner)
+
+    # "done"/"error" are turn-lifecycle signals consumed directly by
+    # `ChatSessionBackend.prompt`, never translated into a `session/update`.
+    return []
+
+
+def _acp_updates_from_output_item(inner: dict[str, Any]) -> list[dict[str, Any]]:
+    inner_type = inner.get("type")
+
+    if inner_type == "function_call":
+        call_id = inner.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return []
+        status = _acp_tool_status(inner.get("status"))
+        session_update = (
+            "tool_call" if status in _PENDING_TOOL_CALL_STATUSES else "tool_call_update"
+        )
+        return [
+            {
+                "sessionUpdate": session_update,
+                "toolCallId": call_id,
+                "title": inner.get("name"),
+                "status": status,
+                "rawInput": inner.get("arguments"),
+            }
+        ]
+
+    if inner_type == "function_call_output":
+        call_id = inner.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return []
+        output = inner.get("output")
+        output_text = output if isinstance(output, str) else ("" if output is None else str(output))
+        return [
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call_id,
+                "content": [{"type": "content", "content": {"type": "text", "text": output_text}}],
+            }
+        ]
+
+    if inner_type == "message":
+        # Its text already streamed as "delta" items -- emitting it again here would
+        # double-send the same text, exactly what the gateway's `_stream`/`_collect`
+        # avoid by only handling "delta"/"output"-with-tool-call-content and treating
+        # everything else as DB-only.
+        return []
+
+    if inner_type == "reasoning":
+        text = _reasoning_item_text(inner)
+        if not text:
+            return []
+        return [{"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": text}}]
+
+    return []
+
+
+def _acp_tool_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _TOOL_CALL_STATUSES else "in_progress"
+
+
+def _reasoning_item_text(item: dict[str, Any]) -> str:
+    """Extract displayable text from a "reasoning" output item (see `chat_task.py` /
+    `_reasoning_output_item` in `cptr/utils/ai.py`): `content` is a list of blocks,
+    each `{"type": "reasoning_text"|"text"|"output_text", "text": ...}`.
+    """
+    blocks = item.get("content")
+    if not isinstance(blocks, list):
+        return ""
+    return "".join(
+        block.get("text") or ""
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("type") in ("reasoning_text", "text", "output_text")
+    )
+
+
 class ChatSessionBackend:
     """Maps ACP sessions onto `Chat` rows scoped to one authenticated user."""
 
     def __init__(self, user_id: str) -> None:
         self.user_id = user_id
+        # session_id -> assistant ChatMessage.id for the turn currently running,
+        # so `cancel()` can find the real background task to stop.
+        self._running: dict[str, str] = {}
+        # session_id -> True once `cancel()` has been called for it, consulted by
+        # the queue-consumption loop in `prompt()` to know whether a "done"/"error"
+        # item (or a consumer-side timeout) means "cancelled" rather than a normal
+        # end-of-turn/failure.
+        self._cancelled: dict[str, bool] = {}
 
     async def new_session(self, cwd: str, params: dict[str, Any]) -> str:
         from cptr.models import Chat
         from cptr.utils.config import now_ms
+        from cptr.utils.chat_export import chat_directory
+        from cptr.utils.workspace import ensure_cptr_gitignored
 
         chat = await Chat.create(
             user_id=self.user_id,
             title="ACP session",
             meta={
                 "workspace": cwd,
-                # step 3: chat params (e.g. tool_approval_mode) will be sourced
-                # explicitly -- `params` here is the raw `session/new` JSON-RPC params
-                # dict, which has no nested "params" key of its own.
-                "params": {},
+                # step 4: permission bridge makes ask/auto work over ACP -- until
+                # then, "full" is the only mode that can complete a turn without a
+                # `session/request_permission` round trip nothing here answers yet.
+                "params": {"tool_approval_mode": "full"},
                 "acp": {"created_via": "acp"},
             },
             created_at=now_ms(),
         )
-        # step 3: mirror routers/chat.py's chats-dir + gitignore setup for workspace
-        # chats (chats_dir.mkdir + ensure_cptr_gitignored) once prompt bridging
-        # actually persists messages into that directory.
+        # Mirror routers/chat.py:send_message's chats-dir + gitignore setup for a
+        # brand new workspace chat, now that `prompt()` actually persists messages
+        # (and `run_chat_task`'s export pass) into that directory.
+        chats_dir = chat_directory(cwd)
+        await asyncio.to_thread(lambda: chats_dir.mkdir(parents=True, exist_ok=True))
+        await asyncio.to_thread(ensure_cptr_gitignored, cwd)
         return chat.id
 
     async def load_session(self, session_id: str, cwd: str) -> bool:
@@ -303,7 +553,7 @@ class ChatSessionBackend:
         must be indistinguishable from a nonexistent session.
 
         This is the full extent of "load" today: no resume-state mapping (message
-        replay) happens here yet -- that lands in step 3.
+        replay) happens here yet -- that lands in a later step.
         """
         from cptr.models import Chat
 
@@ -315,8 +565,133 @@ class ChatSessionBackend:
             return False
         return True
 
-    async def prompt(self, session_id: str, prompt_items: list[dict[str, Any]]) -> dict[str, Any]:
-        raise NotImplementedError
+    async def prompt(
+        self, session_id: str, prompt_items: list[dict[str, Any]], notify: NotifyFn
+    ) -> dict[str, Any]:
+        """Run one real `run_chat_task` turn and stream it as ACP `session/update`s.
+
+        Mirrors `routers/chat.py:send_message`'s message-row creation pattern and
+        `routers/gateway.py`'s `output_queue` consumption, translating each queued
+        item through `acp_updates_from_queue_item` instead of OpenAI SSE chunks.
+        """
+        from cptr.models import Chat, ChatMessage
+        from cptr.utils.chat_task import start_task
+        from cptr.utils.config import now_ms
+        from cptr.utils.model_targets import first_api_model_target, resolve_model_target
+
+        chat = await Chat.get_by_id(session_id)
+        if chat is None or chat.user_id != self.user_id:
+            # Defense in depth: the connection's authorized-session set already
+            # gates this, but a session could in principle vanish/change owner
+            # between `session/new`/`session/load` and this call.
+            raise PromptRejected("session not found")
+
+        # images: later -- only "text" prompt items are used for this turn.
+        text = "\n\n".join(
+            item.get("text", "")
+            for item in prompt_items
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        ).strip()
+        if not text:
+            raise PromptRejected("empty prompt")
+
+        meta = dict(chat.meta or {})
+        workspace = meta.get("workspace") or ""
+        last_model = meta.get("last_model")
+
+        target = None
+        if isinstance(last_model, str) and last_model:
+            try:
+                target = await resolve_model_target(last_model)
+            except Exception:
+                target = None
+        if target is None:
+            try:
+                target = await first_api_model_target()
+            except Exception as exc:
+                raise PromptRejected("no model configured") from exc
+
+        if meta.get("last_model") != target.full_model_id:
+            meta["last_model"] = target.full_model_id
+            await Chat.update_meta(session_id, meta, now_ms())
+
+        user_msg = await ChatMessage.create(
+            chat_id=session_id,
+            role="user",
+            content=text,
+            parent_id=chat.current_message_id,
+            created_at=now_ms(),
+        )
+        assistant_msg = await ChatMessage.create(
+            chat_id=session_id,
+            role="assistant",
+            content="",
+            parent_id=user_msg.id,
+            model=target.full_model_id,
+            done=False,
+            created_at=now_ms(),
+        )
+        await Chat.update_current_message(session_id, assistant_msg.id, now_ms())
+
+        output_queue: asyncio.Queue = asyncio.Queue()
+        start_task(
+            message_id=assistant_msg.id,
+            chat_id=session_id,
+            user_id=self.user_id,
+            workspace=workspace,
+            output_queue=output_queue,
+            target=target,
+        )
+        self._running[session_id] = assistant_msg.id
+        try:
+            while True:
+                cancelled = self._cancelled.get(session_id, False)
+                try:
+                    if cancelled:
+                        # A cancelled `run_chat_task` may die without ever pushing a
+                        # "done"/"error" item (e.g. cancelled mid-`finally`); don't
+                        # let that hang this turn's response forever.
+                        item = await asyncio.wait_for(output_queue.get(), timeout=5)
+                    else:
+                        item = await output_queue.get()
+                except asyncio.TimeoutError:
+                    return {"stopReason": "cancelled"}
+
+                if item is None:
+                    # `run_chat_task`'s unconditional end-of-task sentinel (see its
+                    # `finally`); only reached if no "done"/"error" arrived first.
+                    return {
+                        "stopReason": "cancelled"
+                        if self._cancelled.pop(session_id, False)
+                        else "end_turn"
+                    }
+
+                item_type = item.get("type")
+                if item_type == "done":
+                    return {
+                        "stopReason": "cancelled"
+                        if self._cancelled.pop(session_id, False)
+                        else "end_turn"
+                    }
+                if item_type == "error":
+                    if self._cancelled.get(session_id, False):
+                        return {"stopReason": "cancelled"}
+                    # Detail stays server-side (logged); the connection layer turns
+                    # this into a fixed `-32603 internal error` for the client.
+                    raise RuntimeError(str(item.get("message", "chat task error")))
+
+                for update in acp_updates_from_queue_item(item):
+                    await notify(update)
+        finally:
+            self._running.pop(session_id, None)
+            self._cancelled.pop(session_id, None)
 
     async def cancel(self, session_id: str) -> None:
-        return None
+        from cptr.utils.chat_task import cancel_task
+
+        self._cancelled[session_id] = True
+        message_id = self._running.get(session_id)
+        if message_id:
+            await cancel_task(message_id)

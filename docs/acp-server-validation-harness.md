@@ -210,6 +210,28 @@ Decisions made while implementing (with adversarial review at each step):
   unauthorized ids are indistinguishable from nonexistent (`-32001`). Internal errors
   return a fixed string (no `str(exc)` — it leaked SQL/schema in review). Parse
   errors/binary frames → `-32700`, connection survives.
+- **Step 3 (landed):** `session/prompt` bridges into a real `run_chat_task` turn;
+  `session/cancel` stops it mid-turn. `session/prompt` handling runs on a background
+  `asyncio.Task` per session (tracked in `AcpServerConnection._prompt_tasks`) so the
+  serve loop stays live for `session/cancel` on the same connection — one in-flight
+  prompt per session (`-32000` on a second concurrent one), independent sessions run
+  fully concurrently. `acp_updates_from_queue_item` is the pure translation layer
+  (mirrors the client-side `acp_text_from_update`/`acp_tool_from_update`): `delta` →
+  `agent_message_chunk`, `function_call` → `tool_call`/`tool_call_update` by status,
+  `function_call_output` → `tool_call_update` with nested `content`, `message` → no
+  update (already streamed as deltas — matches the OpenAI gateway's dedup), `reasoning`
+  → `agent_thought_chunk` when it has text. `PromptRejected(message)` is the one
+  backend exception with a safe, client-visible message (e.g. "no model configured",
+  "empty prompt"); anything else becomes the fixed `-32603 internal error` (logged
+  server-side only, never `str(exc)`). Cancellation robustness: once `cancel()` has
+  been signalled, the queue consumer switches to a bounded `wait_for(..., timeout=5)`
+  so a `run_chat_task` that dies without ever pushing a `"done"`/`"error"` item still
+  resolves the turn as `cancelled` instead of hanging. On transport close, the
+  connection cancels every in-flight prompt via `backend.cancel` first (letting the
+  real turn unwind normally) before forcing task cancellation as a last resort.
+  Validated end to end (Tier 1) against a scripted local OpenAI-compatible SSE server
+  (`tests/test_acp_prompt_e2e.py`) — real `stream_openai_completions` over a real
+  socket, zero real LLM calls.
 
 Accepted risks / systemic notes (inherited from existing app patterns, flagged during
 step 2 review — revisit before any public exposure):

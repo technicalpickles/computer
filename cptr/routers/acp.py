@@ -32,9 +32,9 @@ router = APIRouter(prefix="/api/acp", tags=["acp"])
 async def acp_ws(websocket: WebSocket):
     """ACP agent endpoint (`/api/acp/ws`): initialize / authenticate / session/new /
     session/load, with `session/prompt`/`session/cancel` gated by a per-connection
-    authorized-session set (see `cptr/utils/acp_server.py`). Real `session/prompt`
-    bridging into `run_chat_task` lands in step 3; for now it is stubbed by
-    `ChatSessionBackend`.
+    authorized-session set (see `cptr/utils/acp_server.py`). `session/prompt` bridges
+    into a real `run_chat_task` turn and streams `session/update` notifications;
+    `session/cancel` stops it mid-turn (`ChatSessionBackend`).
     """
     client_host = websocket.client.host if websocket.client else "127.0.0.1"
     token = websocket.cookies.get("cptr_session") or websocket.query_params.get("token")

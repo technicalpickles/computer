@@ -397,6 +397,22 @@ def start_task(
     _tasks[message_id] = task
     _task_chat[message_id] = chat_id
 
+    def _cleanup_tasks_entry(_task: asyncio.Task) -> None:
+        # Backstop for `_tasks`/`is_running`/`get_active_chat_ids` bookkeeping:
+        # `run_chat_task`'s own `finally` (further down, past its pre-loop setup)
+        # already does this same pop on every path that actually reaches it, so
+        # this is normally a harmless no-op duplicate. It stops mattering only if
+        # this task is cancelled before it is ever scheduled to run even once
+        # (e.g. `cancel_task()` called immediately after `start_task()`, with no
+        # `await` in between) -- then the `CancelledError` is raised before
+        # `run_chat_task` reaches its own `try`, so that `finally` never runs and
+        # the entry would otherwise leak in `_tasks` forever (a real regression
+        # hit wiring up ACP's cancel-racing-setup fix, which calls `cancel_task`
+        # exactly that early).
+        _tasks.pop(message_id, None)
+
+    task.add_done_callback(_cleanup_tasks_entry)
+
     async def emit_active():
         unread_counts = await Chat.unread_counts_by_workspace(
             user_id, [workspace], get_active_chat_ids()
@@ -785,7 +801,9 @@ async def generate_chat_title(
 # ── Message history ─────────────────────────────────────────
 
 
-def _output_items_to_messages(output_items: list[dict], message_id: str | None = None) -> list[dict]:
+def _output_items_to_messages(
+    output_items: list[dict], message_id: str | None = None
+) -> list[dict]:
     """Convert ordered persisted output items into model-visible messages."""
     native_agent_call_ids = {
         item["call_id"]

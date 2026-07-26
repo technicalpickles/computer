@@ -29,9 +29,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # The wheel force-includes the built frontend; tests don't need it,
-      # but the editable install fails if the directory is absent.
+      # but the editable install fails if the directory is absent. The _app
+      # subdir must exist too: app.py mounts it whenever build/ exists.
       - name: Stub frontend build output
-        run: mkdir -p cptr/frontend/build
+        run: mkdir -p cptr/frontend/build/_app
 
       - name: Run tests
         run: uv run pytest -q

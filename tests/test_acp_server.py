@@ -9,6 +9,7 @@ server and client sides of the protocol are validated against each other directl
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Awaitable, Callable
 
 import pytest
@@ -269,7 +270,9 @@ class TestSessionNew:
 
         assert first["result"]["sessionId"] == "server-sess-1"
         assert second["result"]["sessionId"] == "server-sess-1"
-        assert third["error"]["code"] == -32000
+        # MIN-9: "session/new cap reached" has its own code, split off from the
+        # generic -32000 `PromptRejected` bucket it used to share.
+        assert third["error"]["code"] == -32003
         assert len(backend.new_session_calls) == 2
 
         await _teardown(client_transport, task)
@@ -686,16 +689,106 @@ class TestAcpUpdatesFromQueueItem:
                 "content": [
                     {"type": "content", "content": {"type": "text", "text": "file1\nfile2"}}
                 ],
+                # MIN-3: explicit "completed" so the client's last-write-wins status
+                # parsing doesn't reset an already-completed call to in_progress.
+                "status": "completed",
             }
         ]
         parsed = acp_tool_from_update({"update": updates[0]})
         assert parsed["call_id"] == "call_1"
         assert parsed["output"] == "file1\nfile2"
+        assert parsed["status"] == "completed"
 
     def test_function_call_output_missing_call_id_yields_no_updates(self):
         item = {"type": "output", "item": {"type": "function_call_output", "output": "x"}}
 
         assert acp_updates_from_queue_item(item) == []
+
+    def test_function_call_output_non_str_output_is_json_not_repr(self):
+        """MIN-10: a non-str tool output must be JSON (matching the client's own
+        `rawOutput` convention in `_tool_output`/`cptr/utils/agents/acp.py`), not
+        Python's `str()` repr (single-quoted keys, `None`/`True` -- not valid JSON
+        and unpleasant to read as a user).
+        """
+        item = {
+            "type": "output",
+            "item": {"type": "function_call_output", "call_id": "call_1", "output": {"a": 1}},
+        }
+
+        updates = acp_updates_from_queue_item(item)
+
+        assert updates[0]["content"][0]["content"]["text"] == json.dumps({"a": 1}, indent=2)
+
+    def test_function_call_output_with_call_meta_carries_title_and_status_completed_round_trip(
+        self,
+    ):
+        """MIN-3 regression (adapted from the reviewer's probe E): replay the exact
+        `output_queue` sequence `run_chat_task.emit()` produces for one auto-approved
+        tool call -- a "function_call" (in_progress), a "function_call" (completed),
+        then a "function_call_output" -- through the server translation with
+        `call_meta` threaded through (as `ChatSessionBackend.prompt` does), then
+        through the client-side parser (`acp_tool_from_update`), simulating the same
+        last-write-wins merge `chat_task.py`'s `AgentToolUpdate` handler does
+        (`event.name or existing.get("name")` for name, plain overwrite for status,
+        dict-merge for arguments). Before the fix: the final merged state had
+        `status == "in_progress"` (the output update carried no status at all, and
+        the client defaults a missing status to "in_progress") and
+        `arguments["title"] == "Agent tool"` (clobbering "write_file", since the
+        output update carried no title/rawInput either, so the client fell back to
+        deriving a generic name). Both must now be preserved.
+        """
+        queue_items = [
+            {
+                "type": "output",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "write_file",
+                    "arguments": {"path": "a.txt", "content": "hi"},
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "output",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "write_file",
+                    "arguments": {"path": "a.txt", "content": "hi"},
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "output",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "wrote a.txt",
+                },
+            },
+        ]
+
+        call_meta: dict[str, dict] = {}
+        state: dict = {}
+        for queue_item in queue_items:
+            for update in acp_updates_from_queue_item(queue_item, call_meta=call_meta):
+                parsed = acp_tool_from_update({"update": update})
+                assert parsed is not None
+                state = {
+                    **state,
+                    "call_id": parsed["call_id"],
+                    "name": parsed["name"] or state.get("name"),
+                    "status": parsed["status"],
+                    "arguments": {**state.get("arguments", {}), **parsed["arguments"]},
+                    "output": parsed["output"]
+                    if parsed["output"] is not None
+                    else state.get("output"),
+                }
+
+        assert state["status"] == "completed"
+        assert state["arguments"]["title"] == "write_file"
+        assert state["arguments"]["input"] == {"path": "a.txt", "content": "hi"}
+        assert state["output"] == "wrote a.txt"
 
     def test_message_item_yields_no_updates_its_text_already_streamed_as_deltas(self):
         item = {
@@ -846,7 +939,9 @@ class TestPromptConcurrencyAndCancel:
         second = await _request(
             client_transport, 4, "session/prompt", {"sessionId": session_id, "prompt": []}
         )
-        assert second["error"]["code"] == -32000
+        # MIN-9: "prompt already in progress" has its own code (-32004), split off
+        # from the generic -32000 `PromptRejected` bucket it used to share.
+        assert second["error"]["code"] == -32004
         assert "already in progress" in second["error"]["message"]
         # The rejected duplicate must never even reach the backend.
         assert len(backend.prompt_calls) == 1
@@ -1009,42 +1104,55 @@ class TestDisconnectMidPrompt:
 class TestDogfoodPromptRoundTrip:
     """Runs a real `AcpClient.prompt()` against the server (step 3's payoff): the
     server-side translation and the client-side parsers must agree on every shape.
+
+    MIN-8: `prompt_impl` below feeds raw `output_queue`-shaped items (exactly what
+    `run_chat_task.emit()` pushes, and what `ChatSessionBackend.prompt` actually
+    consumes) through the real `acp_updates_from_queue_item` translation layer
+    before calling `notify` -- so this test chains the real translation *and* the
+    real client-side parsers together, instead of hand-authoring already-translated
+    `session/update` dicts and only exercising the parser half.
     """
 
     async def test_client_prompt_parses_streamed_text_and_tool_updates(self):
         client_transport, server_transport = connected_pair()
 
         async def prompt_impl(session_id, prompt_items, notify):
-            await notify(
+            queue_items = [
+                {"type": "delta", "content": "Hello "},
+                {"type": "delta", "content": "world"},
                 {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "Hello "},
-                }
-            )
-            await notify(
+                    "type": "output",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "run_command",
+                        "arguments": {"command": "ls"},
+                        "status": "in_progress",
+                    },
+                },
                 {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "world"},
-                }
-            )
-            await notify(
+                    "type": "output",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "run_command",
+                        "arguments": {"command": "ls"},
+                        "status": "completed",
+                    },
+                },
                 {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "call_1",
-                    "title": "run_command",
-                    "status": "in_progress",
-                    "rawInput": {"command": "ls"},
-                }
-            )
-            await notify(
-                {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "call_1",
-                    "content": [
-                        {"type": "content", "content": {"type": "text", "text": "file1\nfile2"}}
-                    ],
-                }
-            )
+                    "type": "output",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "file1\nfile2",
+                    },
+                },
+            ]
+            call_meta: dict[str, dict] = {}
+            for queue_item in queue_items:
+                for update in acp_updates_from_queue_item(queue_item, call_meta=call_meta):
+                    await notify(update)
             return {"stopReason": "end_turn"}
 
         backend = StubBackend(session_id="dogfood-turn", prompt_impl=prompt_impl)
@@ -1078,12 +1186,22 @@ class TestDogfoodPromptRoundTrip:
         result = await prompt_task
         assert result["stopReason"] == "end_turn"
         assert "".join(texts) == "Hello world"
-        assert len(tools) == 2
+        # Real translation emits one update per queue item that produces one:
+        # in_progress function_call -> tool_call, completed function_call ->
+        # tool_call_update, function_call_output -> tool_call_update.
+        assert len(tools) == 3
         assert tools[0]["call_id"] == "call_1"
         assert tools[0]["name"] == "run_command"
         assert tools[0]["arguments"] == {"command": "ls"}
+        assert tools[0]["status"] == "in_progress"
         assert tools[1]["call_id"] == "call_1"
-        assert tools[1]["output"] == "file1\nfile2"
+        assert tools[1]["status"] == "completed"
+        assert tools[2]["call_id"] == "call_1"
+        assert tools[2]["output"] == "file1\nfile2"
+        # MIN-3: the output update carries call_meta (name/status) so the tool
+        # call's identity survives -- not clobbered to a generic "agent_tool".
+        assert tools[2]["name"] == "run_command"
+        assert tools[2]["status"] == "completed"
 
         await client.close()
         if not server_task.done():

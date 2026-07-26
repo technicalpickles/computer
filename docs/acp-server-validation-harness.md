@@ -214,24 +214,57 @@ Decisions made while implementing (with adversarial review at each step):
   `session/cancel` stops it mid-turn. `session/prompt` handling runs on a background
   `asyncio.Task` per session (tracked in `AcpServerConnection._prompt_tasks`) so the
   serve loop stays live for `session/cancel` on the same connection — one in-flight
-  prompt per session (`-32000` on a second concurrent one), independent sessions run
-  fully concurrently. `acp_updates_from_queue_item` is the pure translation layer
-  (mirrors the client-side `acp_text_from_update`/`acp_tool_from_update`): `delta` →
-  `agent_message_chunk`, `function_call` → `tool_call`/`tool_call_update` by status,
-  `function_call_output` → `tool_call_update` with nested `content`, `message` → no
-  update (already streamed as deltas — matches the OpenAI gateway's dedup), `reasoning`
-  → `agent_thought_chunk` when it has text. `PromptRejected(message)` is the one
+  prompt per connection-session pair rejected with `-32004` on a second concurrent
+  one; independent sessions run fully concurrently. `acp_updates_from_queue_item` is
+  the pure translation layer (mirrors the client-side
+  `acp_text_from_update`/`acp_tool_from_update`): `delta` → `agent_message_chunk`,
+  `function_call` → `tool_call`/`tool_call_update` by status, `function_call_output`
+  → `tool_call_update` with nested `content` and an explicit `status: "completed"`
+  (plus the original call's `title`/`rawInput`, threaded through via a caller-owned
+  `call_meta` map) so the client's last-write-wins parsing doesn't reset a finished
+  call back to in-progress or clobber its name, `message` → no update (already
+  streamed as deltas — matches the OpenAI gateway's dedup), `reasoning` →
+  `agent_thought_chunk` when it has text. `PromptRejected(message)` is the one
   backend exception with a safe, client-visible message (e.g. "no model configured",
-  "empty prompt"); anything else becomes the fixed `-32603 internal error` (logged
-  server-side only, never `str(exc)`). Cancellation robustness: once `cancel()` has
-  been signalled, the queue consumer switches to a bounded `wait_for(..., timeout=5)`
-  so a `run_chat_task` that dies without ever pushing a `"done"`/`"error"` item still
-  resolves the turn as `cancelled` instead of hanging. On transport close, the
-  connection cancels every in-flight prompt via `backend.cancel` first (letting the
-  real turn unwind normally) before forcing task cancellation as a last resort.
-  Validated end to end (Tier 1) against a scripted local OpenAI-compatible SSE server
-  (`tests/test_acp_prompt_e2e.py`) — real `stream_openai_completions` over a real
-  socket, zero real LLM calls.
+  "empty prompt", `-32000`); its subclass `PromptBusy` (`-32004`) covers "already in
+  flight"; anything else becomes the fixed `-32603 internal error` (logged
+  server-side only, never `str(exc)`).
+
+  **Cancellation, revised after adversarial review found it losable and leak-prone:**
+  `ChatSessionBackend.prompt` now claims `session_id` — both in its own `_running`
+  map and in a class-level, process-wide `_inflight_chats` registry — atomically,
+  before its first `await`. This closes two gaps at once: a `session/cancel` racing
+  the setup between claiming the turn and `start_task` actually running (chat fetch,
+  model resolution, message creation) is no longer silently dropped — `prompt()`
+  rechecks the cancelled flag immediately after `start_task` and stops the turn right
+  there if it was set mid-setup — and a second connection that `session/load`s the
+  same chat can no longer run a concurrent turn on it (the per-connection
+  `_prompt_tasks` gate alone never caught that). `cancel()` is now a no-op — beyond
+  its own bookkeeping — for a session with no claimed turn, so a cancel that arrives
+  after a turn already finished can never poison the *next* one into falsely
+  reporting "cancelled". Every abnormal exit from `prompt()`'s turn loop (any
+  exception — including `CancelledError` from a dead `notify()` or a force-cancelled
+  ACP task — or the bounded `wait_for(..., timeout=5)` on the queue after cancel
+  giving up) now calls `cancel_task` in `finally`, not just the two designated
+  normal exits (`"done"`/consumed `"error"`); only those two skip it, since the
+  underlying task has already reached its own terminal, persisted state by the time
+  either arrives. On transport close, `_cancel_all_prompts` calls `backend.cancel`
+  first (bounded and shielded so its own cancellation can't abort the cleanup loop
+  partway through), waits generously for each prompt task to finish on its own
+  (long enough to outlast `prompt()`'s own worst-case cancelled-turn timeline —
+  tightening this below that was tried during review and reproducibly left a stray
+  `chat_task._tasks` entry via a second, overlapping cancellation), and only then
+  force-cancels and re-asserts `backend.cancel` as a last resort. Separately,
+  `chat_task.start_task` now attaches an `add_done_callback` that pops `_tasks`
+  unconditionally: `run_chat_task`'s own cleanup lives in a `finally` that starts
+  partway through the function, so a task cancelled before it's ever scheduled to
+  run once (exactly what the setup-race recheck above can now trigger) used to skip
+  that `finally` entirely and leak its `_tasks` entry forever.
+
+  Validated end to end (Tier 1) against a scripted local OpenAI-compatible SSE
+  server (`tests/test_acp_prompt_e2e.py`) — real `stream_openai_completions` over a
+  real socket, zero real LLM calls, including a full tool-call turn (`run_command`,
+  auto-executed under this session's `tool_approval_mode="full"`).
 
 Accepted risks / systemic notes (inherited from existing app patterns, flagged during
 step 2 review — revisit before any public exposure):
@@ -244,3 +277,14 @@ step 2 review — revisit before any public exposure):
 - No role gate beyond authentication; matches the rest of the app.
 - Protocol version is not negotiated — the server always answers `protocolVersion: 1`
   (consistent with ACP: the agent picks).
+- `session/new` creates `chats_dir`/`.gitignore` (`chat_directory` +
+  `ensure_cptr_gitignored`, mirroring `routers/chat.py:send_message`) for *any*
+  valid absolute `cwd` an authenticated user names — a real mkdir/write side effect
+  on the server's filesystem, gated only by the `cwd` validation in
+  `AcpServerConnection._validate_cwd` (absolute, no `..`, bounded length), not by
+  any check that the path is a workspace the user is actually meant to have.
+- ACP chats persist `tool_approval_mode: "full"` on the `Chat` row's `meta.params`
+  (step 4 will make this configurable). Until then, if the same user opens that
+  chat in the web UI, the UI honors that stored mode too — i.e. an ACP-created chat
+  keeps auto-executing tools without approval even when driven from the web, not
+  just over ACP.
